@@ -75,8 +75,7 @@ async def pick_gift_id(app: Client, requested: int | None) -> int:
             if getattr(g, "id", None) == requested:
                 return requested
     
-    # Corrected: Get ID from the first item in the list
-    return gift_list[0].id
+    return gift_list[0].id # Pick first gift ID correctly
 
 # -------------------------
 # FASTAPI SETUP
@@ -92,10 +91,10 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def home():
-    return {"status": "online", "message": "API Key & Gift Service"}
+    return {"status": "online", "message": "API Key & Gift Service Active"}
 
 # -------------------------
-# API: SEND GIFT
+# API: SEND GIFT (Hardened with JSON Errors)
 # -------------------------
 @app.api_route("/send-gift", methods=["GET", "POST"])
 async def send_gift_api(
@@ -116,22 +115,22 @@ async def send_gift_api(
 
     try:
         await client.start()
-        await asyncio.sleep(1.5) # Wait for handshake to prevent ConnectionError
+        await asyncio.sleep(1.5) # Prevent ConnectionError
 
-        # 1. DM Check
+        # 1. Peer Resolution
         try:
             peer = await client.resolve_peer(clean_target)
         except Exception:
             return JSONResponse(status_code=403, content={
                 "status": "error", 
-                "message": f"User @{clean_target} must DM the account first."
+                "message": f"Target user @{clean_target} must DM the account first or is invalid."
             })
 
         # 2. Gift Selection
         req_id = int(gift_id) if gift_id and gift_id.isnumeric() else None
         valid_gift_id = await pick_gift_id(client, req_id)
 
-        # 3. Invoice & Send
+        # 3. Invoice & Payment Form
         invoice = raw.types.InputInvoiceStarGift(
             peer=peer, gift_id=valid_gift_id, hide_name=hide_name,
             include_upgrade=include_upgrade,
@@ -141,23 +140,35 @@ async def send_gift_api(
         form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
         form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
         
+        # 4. Final Send
         result = await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
 
         return JSONResponse(status_code=200, content={
             "status": "success",
             "message": "Gift sent successfully!",
-            "payload": {
-                "target_user": clean_target,
-                "api_key_used": session,
+            "data": {
+                "target": clean_target,
+                "api_key": session,
                 "gift_id": str(valid_gift_id),
-                "is_anonymous": hide_name,
-                "result": "Success"
+                "is_anonymous": hide_name
             }
         })
 
+    except errors.RPCError as e:
+        # Catch ALL Telegram Errors (Balance low, Flood, etc.)
+        return JSONResponse(status_code=400, content={
+            "status": "error",
+            "error_code": e.CODE,
+            "error_name": e.ID,
+            "message": f"Telegram Error: {e.MESSAGE}"
+        })
     except Exception as e:
+        # Catch Unhandled Python errors
         print(f"CRITICAL ERROR: {traceback.format_exc()}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        return JSONResponse(status_code=500, content={
+            "status": "error",
+            "message": f"Internal System Error: {str(e)}"
+        })
     finally:
         if client.is_connected: await client.stop()
 
@@ -185,7 +196,7 @@ async def handle_bot_logic(c, m: Message):
 
     if text == "➕ Create API Key":
         user_states[user_id] = {"step": "phone"}
-        await m.reply("📱 Send **Phone Number** (with +):", reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True))
+        await m.reply("📱 Send **Phone Number** (with country code):", reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True))
         return
 
     if text == "⚙️ API Key Settings":
@@ -199,7 +210,6 @@ async def handle_bot_logic(c, m: Message):
         await m.reply("Select Key:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
         return
 
-    # VIEW KEY DETAILS & DELETE BUTTON
     user_keys = mapping.get(user_id, [])
     if text in user_keys:
         key_name = text
@@ -211,7 +221,7 @@ async def handle_bot_logic(c, m: Message):
             me = await client.get_me()
             stars = await get_stars_balance(client)
             info = f"📊 **API Key Details**\n\n👤 Name: {me.first_name}\n🆔 ID: `{me.id}`\n⭐️ Balance: **{stars} Stars**\n📂 Key: `{key_name}`"
-            await status.delete() # Delete loading message
+            await status.delete()
             await m.reply(info, reply_markup=ReplyKeyboardMarkup([[f"🗑 Delete {key_name}"], ["❌ Cancel"]], resize_keyboard=True))
         except (errors.AuthKeyUnregistered, errors.SessionExpired):
             if os.path.exists(path + ".session"): os.remove(path + ".session")
@@ -233,7 +243,7 @@ async def handle_bot_logic(c, m: Message):
             await m.reply(f"✅ Key `{target}` deleted.", reply_markup=ReplyKeyboardMarkup([["➕ Create API Key", "⚙️ API Key Settings"]], resize_keyboard=True))
         return
 
-    # Registration Steps
+    # Registration steps
     if user_id in user_states:
         state = user_states[user_id]
         if state["step"] == "phone":
