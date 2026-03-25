@@ -206,7 +206,7 @@ async def handle_bot_logic(c, m: Message):
                 f"⭐️ Balance: **{stars} Stars**\n"
                 f"📂 Key: `{key_name}`"
             )
-            del_kb = ReplyKeyboardMarkup([[f"🗑 Delete {key_name}"], ["❌ Cancel"]], resize_keyboard=True)
+            await msg.edit_text(info, reply_markup=ReplyKeyboardMarkup([[f"🗑 Delete {key_name}"], ["❌ Cancel"]], resize_keyboard=True))
             await msg.edit_text(info, reply_markup=del_kb)
         except (errors.AuthKeyUnregistered, errors.SessionExpired, errors.UserDeactivatedBan):
             # Auto-delete expired session
