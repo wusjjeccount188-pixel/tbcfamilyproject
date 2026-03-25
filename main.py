@@ -181,7 +181,6 @@ async def handle_bot_logic(c, m: Message):
     text = m.text
     mapping = load_mapping()
 
-    # Cancel any ongoing process
     if text == "❌ Cancel":
         if user_id in user_states:
             if "client" in user_states[user_id]:
@@ -197,7 +196,6 @@ async def handle_bot_logic(c, m: Message):
         )
         return
 
-    # Gift List button: fetch and show available gifts
     if text == "🎁 Gift List":
         await m.reply("🎁 Fetching available gifts...")
         try:
@@ -207,11 +205,10 @@ async def handle_bot_logic(c, m: Message):
                 await m.reply("No gifts available at the moment.")
                 return
 
-            # Build message with emoji and gift ID
             lines = []
             for gift in gifts:
                 gift_id = getattr(gift, "id", "?")
-                # Try to extract emoji from the sticker
+                # Emoji extraction
                 sticker = getattr(gift, "sticker", None)
                 emoji = "🎁"
                 if sticker:
@@ -219,12 +216,14 @@ async def handle_bot_logic(c, m: Message):
                         if isinstance(attr, raw.types.DocumentAttributeSticker):
                             emoji = getattr(attr, "alt", "🎁")
                             break
-                lines.append(f"{emoji} `{gift_id}`")
+                # Price
+                price = getattr(gift, "stars", 0)
+                lines.append(f"{emoji} `{gift_id}` – {price}⭐")
+
             if not lines:
                 await m.reply("Could not retrieve gift details.")
                 return
 
-            # Split into chunks if needed (Telegram message limit ~4096)
             chunk = ""
             for line in lines:
                 if len(chunk) + len(line) + 1 > 4000:
@@ -239,7 +238,6 @@ async def handle_bot_logic(c, m: Message):
             await m.reply(f"❌ Failed to fetch gift list: {e}")
         return
 
-    # ... existing code for creating API keys, settings, etc.
     if text == "➕ Create API Key":
         user_states[user_id] = {"step": "phone"}
         await m.reply(
