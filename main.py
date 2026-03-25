@@ -2,6 +2,7 @@ import os
 import secrets
 import json
 import traceback
+import asyncio
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -53,49 +54,53 @@ user_states = {}
 # -------------------------
 # HELPERS
 # -------------------------
-def get_main_keyboard():
-    return ReplyKeyboardMarkup([
-        ["➕ Create API Key", "⚙️ API Key Settings"]
-    ], resize_keyboard=True)
-
-def get_cancel_keyboard():
-    return ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
-
 async def get_stars_balance(client: Client):
     try:
         res = await client.invoke(raw.functions.payments.GetStarsStatus(peer=await client.resolve_peer("me")))
         if hasattr(res, "balance"):
-            balance_obj = res.balance
-            return getattr(balance_obj, "amount", 0) if not isinstance(balance_obj, int) else balance_obj
+            b = res.balance
+            return getattr(b, "amount", b) if not isinstance(b, int) else b
         return 0
     except:
         return 0
 
 async def pick_gift_id(app: Client, requested: int | None) -> int:
     gifts_obj = await app.invoke(raw.functions.payments.GetStarGifts(hash=0))
-    gifts = getattr(gifts_obj, "gifts", [])
-    if not gifts: raise RuntimeError("No gifts found.")
+    gift_list = getattr(gifts_obj, "gifts", [])
+    if not gift_list:
+        raise RuntimeError("No gifts available in Telegram catalog.")
+
     if requested:
-        for g in gifts:
-            if getattr(g, "id", None) == requested: return requested
-    return gifts[0].id
+        for g in gift_list:
+            if getattr(g, "id", None) == requested:
+                return requested
+    
+    # Corrected: Get ID from the first item in the list
+    return gift_list[0].id
 
 # -------------------------
-# FASTAPI
+# FASTAPI SETUP
 # -------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await app_bot.start()
-    print("✅ Manager Bot & API Online!")
+    print("✅ System Online!")
     yield
     await app_bot.stop()
 
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/")
+async def home():
+    return {"status": "online", "message": "API Key & Gift Service"}
+
+# -------------------------
+# API: SEND GIFT
+# -------------------------
 @app.api_route("/send-gift", methods=["GET", "POST"])
 async def send_gift_api(
     target: str = Query(...),
-    session: str = Query(...),
+    session: str = Query(...), 
     message: str = Query("Enjoy!"),
     gift_id: str | None = Query(None),
     hide_name: bool = Query(False),
@@ -103,49 +108,65 @@ async def send_gift_api(
 ):
     clean_target = target.replace("@", "").strip()
     session_path = make_session_path(session)
+
     if not os.path.exists(session_path + ".session"):
-        return JSONResponse(status_code=404, content={"error": f"API Key '{session}' not found!"})
+        return JSONResponse(status_code=404, content={"status": "error", "message": f"API Key '{session}' not found!"})
 
     client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
-    # --- DM Check Logic ---
-    try:
-        # resolve_peer ব্যবহার করলে যদি ইউজার আগে মেসেজ না দেয় তবে PeerIdInvalid দেয়
-        peer = await client.resolve_peer(clean_target)
-    except (errors.PeerIdInvalid, errors.UsernameInvalid, errors.UsernameNotOccupied):
-        return JSONResponse(
-                status_code=403, 
-                content={"error": f"Target user '@{clean_target}' must send a DM to this account first before sending a gift."}
-        )
 
     try:
         await client.start()
-        peer = await client.resolve_peer(clean_target)
+        await asyncio.sleep(1.5) # Wait for handshake to prevent ConnectionError
+
+        # 1. DM Check
+        try:
+            peer = await client.resolve_peer(clean_target)
+        except Exception:
+            return JSONResponse(status_code=403, content={
+                "status": "error", 
+                "message": f"User @{clean_target} must DM the account first."
+            })
+
+        # 2. Gift Selection
         req_id = int(gift_id) if gift_id and gift_id.isnumeric() else None
         valid_gift_id = await pick_gift_id(client, req_id)
+
+        # 3. Invoice & Send
         invoice = raw.types.InputInvoiceStarGift(
             peer=peer, gift_id=valid_gift_id, hide_name=hide_name,
             include_upgrade=include_upgrade,
             message=raw.types.TextWithEntities(text=message, entities=[])
         )
+
         form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
         form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
+        
         result = await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
-        return {"status": "success", "key_used": session, "gift_id": valid_gift_id, "result": str(result)}
+
+        return JSONResponse(status_code=200, content={
+            "status": "success",
+            "message": "Gift sent successfully!",
+            "payload": {
+                "target_user": clean_target,
+                "api_key_used": session,
+                "gift_id": str(valid_gift_id),
+                "is_anonymous": hide_name,
+                "result": "Success"
+            }
+        })
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        print(f"CRITICAL ERROR: {traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
         if client.is_connected: await client.stop()
-
-@app.get("/")
-async def home():
-    return {"status": "online"}
 
 # -------------------------
 # BOT HANDLERS
 # -------------------------
 @app_bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(c, m: Message):
-    await m.reply("🤖 **Control Panel Connected.**", reply_markup=get_main_keyboard())
+    await m.reply("🤖 **Control Panel Connected.**", reply_markup=ReplyKeyboardMarkup([["➕ Create API Key", "⚙️ API Key Settings"]], resize_keyboard=True))
 
 @app_bot.on_message(filters.text & filters.private)
 async def handle_bot_logic(c, m: Message):
@@ -159,76 +180,60 @@ async def handle_bot_logic(c, m: Message):
                 try: await user_states[user_id]["client"].disconnect()
                 except: pass
             del user_states[user_id]
-        await m.reply("Action stopped.", reply_markup=get_main_keyboard())
+        await m.reply("Action stopped.", reply_markup=ReplyKeyboardMarkup([["➕ Create API Key", "⚙️ API Key Settings"]], resize_keyboard=True))
         return
 
     if text == "➕ Create API Key":
         user_states[user_id] = {"step": "phone"}
-        await m.reply("📱 Send **Phone Number** (with country code):", reply_markup=get_cancel_keyboard())
+        await m.reply("📱 Send **Phone Number** (with +):", reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True))
         return
 
     if text == "⚙️ API Key Settings":
         user_keys = mapping.get(user_id, [])
         valid_keys = [k for k in user_keys if os.path.exists(make_session_path(k) + ".session")]
         if not valid_keys:
-            await m.reply("No API Keys found.", reply_markup=get_main_keyboard())
+            await m.reply("No Keys found.")
             return
         btns = [[k] for k in valid_keys]
         btns.append(["❌ Cancel"])
-        await m.reply("Select an API Key:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
+        await m.reply("Select Key:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
         return
 
-    # --- VIEW KEY DETAILS (FIXED DELETE BUTTON) ---
+    # VIEW KEY DETAILS & DELETE BUTTON
     user_keys = mapping.get(user_id, [])
     if text in user_keys:
         key_name = text
         path = make_session_path(key_name)
         client = Client(path, api_id=API_ID, api_hash=API_HASH)
-        
-        status_msg = await m.reply(f"⌛ Connecting to `{key_name}`...")
+        status = await m.reply(f"⌛ Connecting to `{key_name}`...")
         try:
             await client.connect()
             me = await client.get_me()
             stars = await get_stars_balance(client)
-            
-            info = (
-                f"📊 **API Key Details**\n\n"
-                f"👤 Name: {me.first_name}\n"
-                f"🆔 ID: `{me.id}`\n"
-                f"⭐️ Balance: **{stars} Stars**\n"
-                f"📂 Key: `{key_name}`"
-            )
-            # FIXED: Sending a fresh message to force keyboard update
-            await status_msg.delete()
-            await m.reply(info, reply_markup=ReplyKeyboardMarkup(
-                [[f"🗑 Delete {key_name}"], ["❌ Cancel"]], 
-                resize_keyboard=True
-            ))
+            info = f"📊 **API Key Details**\n\n👤 Name: {me.first_name}\n🆔 ID: `{me.id}`\n⭐️ Balance: **{stars} Stars**\n📂 Key: `{key_name}`"
+            await status.delete() # Delete loading message
+            await m.reply(info, reply_markup=ReplyKeyboardMarkup([[f"🗑 Delete {key_name}"], ["❌ Cancel"]], resize_keyboard=True))
         except (errors.AuthKeyUnregistered, errors.SessionExpired):
             if os.path.exists(path + ".session"): os.remove(path + ".session")
             user_keys.remove(key_name)
             mapping[user_id] = user_keys
             save_mapping(mapping)
-            await status_msg.edit_text(f"❌ Key `{key_name}` expired and auto-deleted.", reply_markup=get_main_keyboard())
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Error: {e}")
+            await status.edit_text(f"❌ Key `{key_name}` expired and auto-deleted.")
         finally:
             if client.is_connected: await client.disconnect()
         return
 
     if text.startswith("🗑 Delete "):
         target = text.replace("🗑 Delete ", "").strip()
-        user_keys = mapping.get(user_id, [])
-        if target in user_keys:
+        if target in mapping.get(user_id, []):
             path = make_session_path(target) + ".session"
             if os.path.exists(path): os.remove(path)
-            user_keys.remove(target)
-            mapping[user_id] = user_keys
+            mapping[user_id].remove(target)
             save_mapping(mapping)
-            await m.reply(f"✅ Key `{target}` deleted.", reply_markup=get_main_keyboard())
+            await m.reply(f"✅ Key `{target}` deleted.", reply_markup=ReplyKeyboardMarkup([["➕ Create API Key", "⚙️ API Key Settings"]], resize_keyboard=True))
         return
 
-    # --- AUTH FLOW ---
+    # Registration Steps
     if user_id in user_states:
         state = user_states[user_id]
         if state["step"] == "phone":
@@ -239,9 +244,9 @@ async def handle_bot_logic(c, m: Message):
                 await client.connect()
                 code = await client.send_code(state["phone"])
                 state.update({"hash": code.phone_code_hash, "client": client, "step": "otp"})
-                await m.reply("📩 **OTP Sent!** Enter code:", reply_markup=get_cancel_keyboard())
+                await m.reply("📩 **OTP Sent!** Enter code:", reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True))
             except Exception as e:
-                await m.reply(f"❌ Error: {e}", reply_markup=get_main_keyboard())
+                await m.reply(f"❌ Error: {e}")
                 del user_states[user_id]
             return
 
@@ -252,14 +257,14 @@ async def handle_bot_logic(c, m: Message):
                 if user_id not in mapping: mapping[user_id] = []
                 mapping[user_id].append(state["name"])
                 save_mapping(mapping)
-                await m.reply(f"✅ API Key Created: `{state['name']}`", reply_markup=get_main_keyboard())
+                await m.reply(f"✅ Created: `{state['name']}`", reply_markup=ReplyKeyboardMarkup([["➕ Create API Key", "⚙️ API Key Settings"]], resize_keyboard=True))
                 await state["client"].disconnect()
                 del user_states[user_id]
             except errors.SessionPasswordNeeded:
                 state["step"] = "2fa"
-                await m.reply("🔐 **2FA Required.** Send Password:", reply_markup=get_cancel_keyboard())
+                await m.reply("🔐 **2FA Password Required.** Send Password:", reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True))
             except Exception as e:
-                await m.reply(f"❌ Error: {e}", reply_markup=get_main_keyboard())
+                await m.reply(f"❌ Error: {e}")
                 del user_states[user_id]
             return
 
@@ -269,7 +274,7 @@ async def handle_bot_logic(c, m: Message):
                 if user_id not in mapping: mapping[user_id] = []
                 mapping[user_id].append(state["name"])
                 save_mapping(mapping)
-                await m.reply(f"✅ API Key Created: `{state['name']}`", reply_markup=get_main_keyboard())
+                await m.reply(f"✅ Created: `{state['name']}`", reply_markup=ReplyKeyboardMarkup([["➕ Create API Key", "⚙️ API Key Settings"]], resize_keyboard=True))
                 await state["client"].disconnect()
                 del user_states[user_id]
             except Exception as e:
