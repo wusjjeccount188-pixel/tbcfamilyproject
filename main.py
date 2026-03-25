@@ -107,6 +107,16 @@ async def send_gift_api(
         return JSONResponse(status_code=404, content={"error": f"API Key '{session}' not found!"})
 
     client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
+    # --- DM Check Logic ---
+    try:
+        # resolve_peer ব্যবহার করলে যদি ইউজার আগে মেসেজ না দেয় তবে PeerIdInvalid দেয়
+        peer = await client.resolve_peer(clean_target)
+    except (errors.PeerIdInvalid, errors.UsernameInvalid, errors.UsernameNotOccupied):
+        return JSONResponse(
+                status_code=403, 
+                content={"error": f"Target user '@{clean_target}' must send a DM to this account first before sending a gift."}
+        )
+
     try:
         await client.start()
         peer = await client.resolve_peer(clean_target)
