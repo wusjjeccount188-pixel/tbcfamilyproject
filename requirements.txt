@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+python-dotenv==1.0.1
+
+pyrotgfork==2.2.19
+tgcrypto==1.2.5
+
+pyaes==1.6.1
+pysocks==1.7.1
