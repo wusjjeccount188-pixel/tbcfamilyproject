@@ -117,13 +117,24 @@ async def send_gift_api(
         await client.start()
         await asyncio.sleep(1.5) # Prevent ConnectionError
 
-        # 1. Peer Resolution
+        # --- ১০০% কার্যকরী DM Check লজিক ---
         try:
+            
             peer = await client.resolve_peer(clean_target)
-        except Exception:
+            
+            # ইউজারের সাথে চ্যাট হিস্ট্রি চেক করা হচ্ছে
+            has_dm = False
+            async for _ in client.get_chat_history(clean_target, limit=1):
+                has_dm = True
+                break
+            
+            if not has_dm:
+                raise errors.PeerIdInvalid 
+
+        except (errors.PeerIdInvalid, errors.UsernameInvalid, Exception):
             return JSONResponse(status_code=403, content={
                 "status": "error", 
-                "message": f"Target user @{clean_target} must DM the account first or is invalid."
+                "message": f"Security: User @{clean_target} must send a message (DM) to this account first!"
             })
 
         # 2. Gift Selection
