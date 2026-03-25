@@ -69,40 +69,40 @@ async def get_stars_balance(client: Client):
         return 0
     except: return 0
 
-async def pick_gift_id(app: Client, requested: int | None) -> int:
-    gifts_obj = await app.invoke(raw.functions.payments.GetStarGifts(hash=0))
-    gift_list = getattr(gifts_obj, "gifts", [])
-    if not gift_list: raise RuntimeError("No gifts available.")
-    if requested:
-        for g in gift_list:
-            if getattr(g, "id", None) == requested: return requested
-    return gift_list[0].id
-
 # -------------------------
-# PAGINATION LOGIC
+# PAGINATION LOGIC (FIXED FOR 7 GIFTS)
 # -------------------------
-def get_gift_page_text(gifts, page=0, page_size=5):
+def get_gift_page_text(gifts, page=0, page_size=7):
     start = page * page_size
     end = start + page_size
     current_gifts = gifts[start:end]
     
-    out = f"🎁 **Telegram Gift Catalog (Page {page + 1})**\n\n"
+    if not current_gifts:
+        return "⚠️ No more gifts found."
+
+    out = f"🎁 **Telegram Gift List (Page {page + 1})**\n"
+    out += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+    
     for g in current_gifts:
         emoji = "🎁"
         if hasattr(g, "sticker") and hasattr(g.sticker, "emoji"):
             emoji = g.sticker.emoji
+        
+        # Format: Emoji | ID | Price
         price = getattr(g, "stars", "N/A")
-        out += f"{emoji} **ID:** `{g.id}`\n💰 **Price:** {price} Stars\n\n"
+        out += f"{emoji} **ID:** `{g.id}` | 💰 `{price}` Stars\n"
     
-    if not current_gifts: return "No more gifts found."
+    out += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+    out += f"Total Gifts: {len(gifts)}"
     return out
 
-def get_gift_pagination_markup(page, total_gifts, page_size=5):
+def get_gift_pagination_markup(page, total_gifts, page_size=7):
     buttons = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"giftpage_{page-1}"))
+        buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"giftp_{page-1}"))
     if (page + 1) * page_size < total_gifts:
-        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"giftpage_{page+1}"))
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"giftp_{page+1}"))
+    
     return InlineKeyboardMarkup([buttons]) if buttons else None
 
 # -------------------------
@@ -129,43 +129,43 @@ async def send_gift_api(
     clean_target = target.replace("@", "").strip()
     session_path = make_session_path(session)
     if not os.path.exists(session_path + ".session"):
-        return JSONResponse(status_code=404, content={"status": "error", "message": "API Key not found!"})
+        return JSONResponse(status_code=404, content={"status": "error", "message": "Key not found!"})
 
     client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
     try:
         await client.start()
         await asyncio.sleep(1.5)
+        peer = await client.resolve_peer(clean_target)
         
-        # DM Check
-        try:
-            peer = await client.resolve_peer(clean_target)
-            has_dm = False
-            async for _ in client.get_chat_history(clean_target, limit=1):
-                has_dm = True
-                break
-            if not has_dm:
-                return JSONResponse(status_code=403, content={"status": "error", "message": "Target must DM first."})
-        except:
-            return JSONResponse(status_code=403, content={"status": "error", "message": "User not found or no DM history."})
+        # DM History Check
+        has_dm = False
+        async for _ in client.get_chat_history(clean_target, limit=1):
+            has_dm = True
+            break
+        if not has_dm:
+            return JSONResponse(status_code=403, content={"status": "error", "message": "Target must DM first."})
 
-        req_id = int(gift_id) if gift_id and gift_id.isnumeric() else None
-        valid_gift_id = await pick_gift_id(client, req_id)
-        
+        # Send Logic
+        gifts_obj = await client.invoke(raw.functions.payments.GetStarGifts(hash=0))
+        gift_list = gifts_obj.gifts
+        valid_id = gift_list[0].id
+        if gift_id:
+            for g in gift_list:
+                if str(g.id) == str(gift_id):
+                    valid_id = g.id
+                    break
+
         invoice = raw.types.InputInvoiceStarGift(
-            peer=peer, gift_id=valid_gift_id,
+            peer=peer, gift_id=valid_id,
             message=raw.types.TextWithEntities(text=message, entities=[]),
             hide_name=True if hide_name else None,
             include_upgrade=True if include_upgrade else None
         )
         form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
-        form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
-        await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
-        
-        return JSONResponse(status_code=200, content={"status": "success", "message": "Gift sent!", "gift_id": str(valid_gift_id)})
-    except errors.RPCError as e:
-        return JSONResponse(status_code=400, content={"status": "error", "error_name": e.ID, "message": e.MESSAGE})
+        await client.invoke(raw.functions.payments.SendStarsForm(form_id=form.form_id, invoice=invoice))
+        return JSONResponse(status_code=200, content={"status": "success", "gift_id": str(valid_id)})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        return JSONResponse(status_code=400, content={"status": "error", "message": str(e)})
     finally:
         if client.is_connected: await client.stop()
 
@@ -176,23 +176,31 @@ async def send_gift_api(
 async def start_cmd(c, m: Message):
     await m.reply("🤖 **Control Panel Connected.**", reply_markup=get_main_keyboard())
 
-@app_bot.on_callback_query(filters.regex(r"^giftpage_(\d+)"))
+@app_bot.on_callback_query(filters.regex(r"^giftp_(\d+)"))
 async def handle_pagination(c, cb: CallbackQuery):
     page = int(cb.matches.group(1))
     user_id = str(cb.from_user.id)
     mapping = load_mapping()
     user_keys = mapping.get(user_id, [])
     valid_keys = [k for k in user_keys if os.path.exists(make_session_path(k) + ".session")]
-    if not valid_keys: return await cb.answer("No active Key.", show_alert=True)
     
+    if not valid_keys:
+        return await cb.answer("No active API Key.", show_alert=True)
+
     client = Client(make_session_path(valid_keys[0]), api_id=API_ID, api_hash=API_HASH)
     try:
         await client.start()
         gifts_obj = await client.invoke(raw.functions.payments.GetStarGifts(hash=0))
-        gift_list = getattr(gifts_obj, "gifts", [])
-        await cb.message.edit_text(get_gift_page_text(gift_list, page), reply_markup=get_gift_pagination_markup(page, len(gift_list)))
-        await client.stop()
-    except Exception as e: await cb.answer(f"Error: {e}")
+        gift_list = gifts_obj.gifts
+        
+        await cb.message.edit_text(
+            get_gift_page_text(gift_list, page),
+            reply_markup=get_gift_pagination_markup(page, len(gift_list))
+        )
+    except Exception as e:
+        await cb.answer(f"Error: {e}", show_alert=True)
+    finally:
+        if client.is_connected: await client.stop()
 
 @app_bot.on_message(filters.text & filters.private)
 async def handle_bot_logic(c, m: Message):
@@ -203,16 +211,23 @@ async def handle_bot_logic(c, m: Message):
     if text == "🎁 Gift List":
         user_keys = mapping.get(user_id, [])
         valid_keys = [k for k in user_keys if os.path.exists(make_session_path(k) + ".session")]
-        if not valid_keys: return await m.reply("❌ Create an API Key first.")
+        if not valid_keys:
+            return await m.reply("❌ Create an API Key first.")
+        
         status = await m.reply("⌛ Loading Catalog...")
         client = Client(make_session_path(valid_keys[0]), api_id=API_ID, api_hash=API_HASH)
         try:
             await client.start()
             gifts_obj = await client.invoke(raw.functions.payments.GetStarGifts(hash=0))
-            gift_list = getattr(gifts_obj, "gifts", [])
-            await status.edit_text(get_gift_page_text(gift_list, 0), reply_markup=get_gift_pagination_markup(0, len(gift_list)))
-            await client.stop()
-        except Exception as e: await status.edit_text(f"Error: {e}")
+            gift_list = gifts_obj.gifts
+            await status.edit_text(
+                get_gift_page_text(gift_list, 0),
+                reply_markup=get_gift_pagination_markup(0, len(gift_list))
+            )
+        except Exception as e:
+            await status.edit_text(f"Error: {e}")
+        finally:
+            if client.is_connected: await client.stop()
         return
 
     if text == "➕ Create API Key":
@@ -230,10 +245,10 @@ async def handle_bot_logic(c, m: Message):
         if user_id in user_states: del user_states[user_id]
         return await m.reply("Stopped.", reply_markup=get_main_keyboard())
 
-    # Settings Detail & Delete
+    # Details & Delete Logic
     user_keys = mapping.get(user_id, [])
     if text in user_keys:
-        client = Client(make_session_path(text), API_ID, API_HASH)
+        client = Client(make_session_path(text), api_id=API_ID, api_hash=API_HASH)
         status = await m.reply(f"⌛ Connecting to `{text}`...")
         try:
             await client.connect()
