@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from pyrogram import Client, filters, errors, raw
-from pyrogram.types import Message, ReplyKeyboardMarkup
+from pyrogram.types import Message, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # -------------------------
 # ENV & PATHS
@@ -73,6 +73,33 @@ async def pick_gift_id(app: Client, requested: int | None) -> int:
         for g in gift_list:
             if getattr(g, "id", None) == requested: return requested
     return gift_list[0].id
+
+def get_gift_name(gift) -> str:
+    """Extract gift name: try title, then sticker emoji, else 'Gift'."""
+    # Try title or name attribute
+    name = getattr(gift, "title", None) or getattr(gift, "name", None)
+    if name:
+        return name
+    # Fallback to sticker emoji
+    sticker = getattr(gift, "sticker", None)
+    if sticker:
+        for attr in getattr(sticker, "attributes", []):
+            if isinstance(attr, raw.types.DocumentAttributeSticker):
+                emoji = getattr(attr, "alt", None)
+                if emoji:
+                    return emoji
+    return "Gift"
+
+def get_gift_emoji(gift) -> str:
+    """Return the emoji from the sticker, if any."""
+    sticker = getattr(gift, "sticker", None)
+    if sticker:
+        for attr in getattr(sticker, "attributes", []):
+            if isinstance(attr, raw.types.DocumentAttributeSticker):
+                emoji = getattr(attr, "alt", None)
+                if emoji:
+                    return emoji
+    return "🎁"
 
 # -------------------------
 # FASTAPI SETUP
@@ -175,6 +202,79 @@ async def start_cmd(c, m: Message):
         )
     )
 
+@app_bot.on_callback_query(filters.regex("^gift_page:"))
+async def handle_gift_pagination(c: Client, query: CallbackQuery):
+    user_id = str(query.from_user.id)
+    action = query.data.split(":")[1] if ":" in query.data else None
+
+    # Get the user's gift browser state
+    state = user_states.get(user_id, {}).get("gift_browser")
+    if not state:
+        await query.answer("Session expired. Please request gift list again.", show_alert=True)
+        await query.message.delete()
+        return
+
+    gifts = state["gifts"]
+    current_page = state["page"]
+    per_page = 16
+    total_pages = (len(gifts) + per_page - 1) // per_page
+
+    if action == "next":
+        if current_page + 1 < total_pages:
+            new_page = current_page + 1
+        else:
+            await query.answer("You're on the last page.")
+            return
+    elif action == "prev":
+        if current_page - 1 >= 0:
+            new_page = current_page - 1
+        else:
+            await query.answer("You're on the first page.")
+            return
+    elif action == "close":
+        # Delete the message and clear state
+        await query.message.delete()
+        del user_states[user_id]["gift_browser"]
+        await query.answer("Gift list closed.")
+        return
+    else:
+        await query.answer("Invalid action.")
+        return
+
+    # Update page in state
+    state["page"] = new_page
+    # Generate new message text
+    start_idx = new_page * per_page
+    end_idx = start_idx + per_page
+    page_gifts = gifts[start_idx:end_idx]
+
+    # Format gift entries
+    lines = []
+    for gift in page_gifts:
+        name = get_gift_name(gift)
+        emoji = get_gift_emoji(gift)
+        gift_id = getattr(gift, "id", "?")
+        price = getattr(gift, "stars", 0)
+        lines.append(f"{emoji} **{name}**\n🆔 `{gift_id}` – {price}⭐\n")
+
+    # Build the message
+    text = f"**🎁 Available Gifts** (Page {new_page+1}/{total_pages})\n\n" + "\n".join(lines)
+
+    # Build inline keyboard
+    buttons = []
+    nav_buttons = []
+    if new_page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data="gift_page:prev"))
+    if new_page + 1 < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data="gift_page:next"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data="gift_page:close")])
+
+    # Edit the original message
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await query.answer()
+
 @app_bot.on_message(filters.text & filters.private)
 async def handle_bot_logic(c, m: Message):
     user_id = str(m.from_user.id)
@@ -182,10 +282,15 @@ async def handle_bot_logic(c, m: Message):
     mapping = load_mapping()
 
     if text == "❌ Cancel":
+        # Clear any ongoing state
         if user_id in user_states:
+            # Disconnect any active client (if creating key)
             if "client" in user_states[user_id]:
                 try: await user_states[user_id]["client"].disconnect()
                 except: pass
+            # Also clear gift browser if present
+            if "gift_browser" in user_states[user_id]:
+                del user_states[user_id]["gift_browser"]
             del user_states[user_id]
         await m.reply(
             "Cancelled.",
@@ -197,7 +302,7 @@ async def handle_bot_logic(c, m: Message):
         return
 
     if text == "🎁 Gift List":
-        await m.reply("🎁 Fetching available gifts...")
+        # Fetch fresh gift list
         try:
             gifts_obj = await app_bot.invoke(raw.functions.payments.GetStarGifts(hash=0))
             gifts = getattr(gifts_obj, "gifts", [])
@@ -205,34 +310,44 @@ async def handle_bot_logic(c, m: Message):
                 await m.reply("No gifts available at the moment.")
                 return
 
+            # Store gifts and initial page in user state
+            if user_id not in user_states:
+                user_states[user_id] = {}
+            user_states[user_id]["gift_browser"] = {
+                "gifts": gifts,
+                "page": 0
+            }
+
+            # Build first page (page 0)
+            per_page = 16
+            start_idx = 0
+            end_idx = min(per_page, len(gifts))
+            page_gifts = gifts[start_idx:end_idx]
+
             lines = []
-            for gift in gifts:
+            for gift in page_gifts:
+                name = get_gift_name(gift)
+                emoji = get_gift_emoji(gift)
                 gift_id = getattr(gift, "id", "?")
-                # Emoji extraction
-                sticker = getattr(gift, "sticker", None)
-                emoji = "🎁"
-                if sticker:
-                    for attr in getattr(sticker, "attributes", []):
-                        if isinstance(attr, raw.types.DocumentAttributeSticker):
-                            emoji = getattr(attr, "alt", "🎁")
-                            break
-                # Price
                 price = getattr(gift, "stars", 0)
-                lines.append(f"{emoji} `{gift_id}` – {price}⭐")
+                lines.append(f"{emoji} **{name}**\n🆔 `{gift_id}` – {price}⭐\n")
 
-            if not lines:
-                await m.reply("Could not retrieve gift details.")
-                return
+            total_pages = (len(gifts) + per_page - 1) // per_page
+            text = f"**🎁 Available Gifts** (Page 1/{total_pages})\n\n" + "\n".join(lines)
 
-            chunk = ""
-            for line in lines:
-                if len(chunk) + len(line) + 1 > 4000:
-                    await m.reply(chunk)
-                    chunk = line + "\n"
-                else:
-                    chunk += line + "\n"
-            if chunk:
-                await m.reply(chunk.strip())
+            # Build inline keyboard
+            buttons = []
+            nav_buttons = []
+            if total_pages > 1:
+                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data="gift_page:next"))
+            if nav_buttons:
+                buttons.append(nav_buttons)
+            buttons.append([InlineKeyboardButton("❌ Close", callback_data="gift_page:close")])
+
+            # Send message and store message_id for future edits
+            sent = await m.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+            user_states[user_id]["gift_browser"]["message_id"] = sent.id
+            user_states[user_id]["gift_browser"]["chat_id"] = sent.chat.id
 
         except Exception as e:
             await m.reply(f"❌ Failed to fetch gift list: {e}")
@@ -301,67 +416,69 @@ async def handle_bot_logic(c, m: Message):
 
     if user_id in user_states:
         state = user_states[user_id]
-        if state["step"] == "phone":
-            state["phone"] = text.replace(" ", "")
-            state["name"] = secrets.token_hex(4)
-            client = Client(make_session_path(state["name"]), API_ID, API_HASH)
-            try:
-                await client.connect()
-                code = await client.send_code(state["phone"])
-                state.update({"hash": code.phone_code_hash, "client": client, "step": "otp"})
-                await m.reply(
-                    "📩 **OTP Sent!** Enter code:",
-                    reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
-                )
-            except Exception as e:
-                await m.reply(f"❌ Error: {e}")
-                del user_states[user_id]
-            return
-
-        if state["step"] == "otp":
-            formatted_otp = " ".join(list(text.replace(" ", "").strip()))
-            try:
-                await state["client"].sign_in(state["phone"], state["hash"], formatted_otp)
-                if user_id not in mapping: mapping[user_id] = []
-                mapping[user_id].append(state["name"])
-                save_mapping(mapping)
-                await m.reply(
-                    f"✅ Created: `{state['name']}`",
-                    reply_markup=ReplyKeyboardMarkup(
-                        [["➕ Create API Key", "⚙️ API Key Settings"], ["🎁 Gift List"]],
-                        resize_keyboard=True
+        # Only handle if this is a key creation flow (not gift browsing)
+        if "step" in state:
+            if state["step"] == "phone":
+                state["phone"] = text.replace(" ", "")
+                state["name"] = secrets.token_hex(4)
+                client = Client(make_session_path(state["name"]), API_ID, API_HASH)
+                try:
+                    await client.connect()
+                    code = await client.send_code(state["phone"])
+                    state.update({"hash": code.phone_code_hash, "client": client, "step": "otp"})
+                    await m.reply(
+                        "📩 **OTP Sent!** Enter code:",
+                        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
                     )
-                )
-                await state["client"].disconnect()
-                del user_states[user_id]
-            except errors.SessionPasswordNeeded:
-                state["step"] = "2fa"
-                await m.reply(
-                    "🔐 **2FA Required.** Send Password:",
-                    reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
-                )
-            except Exception as e:
-                await m.reply(f"❌ Error: {e}")
-                del user_states[user_id]
-            return
+                except Exception as e:
+                    await m.reply(f"❌ Error: {e}")
+                    del user_states[user_id]
+                return
 
-        if state["step"] == "2fa":
-            try:
-                await state["client"].check_password(text.strip())
-                if user_id not in mapping: mapping[user_id] = []
-                mapping[user_id].append(state["name"])
-                save_mapping(mapping)
-                await m.reply(
-                    f"✅ Created: `{state['name']}`",
-                    reply_markup=ReplyKeyboardMarkup(
-                        [["➕ Create API Key", "⚙️ API Key Settings"], ["🎁 Gift List"]],
-                        resize_keyboard=True
+            if state["step"] == "otp":
+                formatted_otp = " ".join(list(text.replace(" ", "").strip()))
+                try:
+                    await state["client"].sign_in(state["phone"], state["hash"], formatted_otp)
+                    if user_id not in mapping: mapping[user_id] = []
+                    mapping[user_id].append(state["name"])
+                    save_mapping(mapping)
+                    await m.reply(
+                        f"✅ Created: `{state['name']}`",
+                        reply_markup=ReplyKeyboardMarkup(
+                            [["➕ Create API Key", "⚙️ API Key Settings"], ["🎁 Gift List"]],
+                            resize_keyboard=True
+                        )
                     )
-                )
-                await state["client"].disconnect()
-                del user_states[user_id]
-            except Exception as e:
-                await m.reply(f"❌ 2FA Error: {e}")
+                    await state["client"].disconnect()
+                    del user_states[user_id]
+                except errors.SessionPasswordNeeded:
+                    state["step"] = "2fa"
+                    await m.reply(
+                        "🔐 **2FA Required.** Send Password:",
+                        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+                    )
+                except Exception as e:
+                    await m.reply(f"❌ Error: {e}")
+                    del user_states[user_id]
+                return
+
+            if state["step"] == "2fa":
+                try:
+                    await state["client"].check_password(text.strip())
+                    if user_id not in mapping: mapping[user_id] = []
+                    mapping[user_id].append(state["name"])
+                    save_mapping(mapping)
+                    await m.reply(
+                        f"✅ Created: `{state['name']}`",
+                        reply_markup=ReplyKeyboardMarkup(
+                            [["➕ Create API Key", "⚙️ API Key Settings"], ["🎁 Gift List"]],
+                            resize_keyboard=True
+                        )
+                    )
+                    await state["client"].disconnect()
+                    del user_states[user_id]
+                except Exception as e:
+                    await m.reply(f"❌ 2FA Error: {e}")
 
 @app.get("/")
 async def health(): return {"status": "ok"}
